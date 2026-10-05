@@ -63,7 +63,7 @@ create view estoque_atual with (security_invoker=true) as
 select coalesce(sum(
   case 
     when tipo in ('estoque_inicial', 'entrada', 'devolucao', 'ajuste') then coalesce(quantidade, 0)
-    when tipo in ('entrega', 'saida', 'perda') then -coalesce(quantidade, 0)
+    when tipo in ('entrega', 'perda') then -coalesce(quantidade, 0)
     else 0
   end
 ), 0) as estoque
@@ -170,7 +170,7 @@ const est = f => (D.m || []).filter(f).reduce((s, x) => {
   const qtd = Number(x.quantidade) || 0;
   if (x.tipo === 'ajuste') return s + qtd;
   if (['estoque_inicial', 'entrada', 'devolucao'].includes(x.tipo)) return s + qtd;
-  if (['entrega', 'saida', 'perda'].includes(x.tipo)) return s - qtd;
+  if (['entrega', 'perda'].includes(x.tipo)) return s - qtd;
   return s;
 }, 0);
 
@@ -194,7 +194,7 @@ function rel(d){
   const ms = (D.m || []).filter(x => x.data == d);
   const ini = est(x => x.data < d);
   const en = S(ms.filter(x => ['entrada','estoque_inicial'].includes(x.tipo)), 'quantidade');
-  const sa = S(ms.filter(x => x.tipo == 'entrega' || x.tipo == 'saida'), 'quantidade');
+  const sa = S(ms.filter(x => x.tipo == 'entrega'), 'quantidade');
   const dv = S(ms.filter(x => x.tipo == 'devolucao'), 'quantidade');
   const at = est(x => x.data <= d);
   const aj = at - (ini + en - sa + dv);
