@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cooperativa de Livros</title>
+<style>
+:root{--bg:#f3f6f4;--card:#fff;--tx:#17302a;--mu:#6b7f78;--ac:#0f6b57;--ac2:#e3f2ed;--bd:#dbe5e0;--rd:#c0392b}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--tx)}
+header{background:var(--ac);color:#fff;padding:12px 14px 0;position:sticky;top:0;z-index:5}
+header b{font-size:17px}nav{display:flex;gap:2px;overflow-x:auto;margin-top:8px}
+nav a{color:#cfe8e0;text-decoration:none;padding:9px 12px;white-space:nowrap;border-radius:8px 8px 0 0}
+nav a.on{background:var(--bg);color:var(--ac);font-weight:600}
+main{padding:14px;max-width:900px;margin:auto}h2{margin:4px 0 12px;font-size:20px}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:12px}
+.k small{color:var(--mu);display:block}.k b{font-size:26px}.k.warn{border-color:var(--rd);background:#fdecea}
+input,select,textarea,button{font:inherit;padding:9px;border:1px solid var(--bd);border-radius:8px;background:#fff;width:100%}
+button{background:var(--ac);color:#fff;border:0;font-weight:600;cursor:pointer}button.s{background:var(--ac2);color:var(--ac)}
+.r{display:flex;gap:8px;margin-bottom:8px}.r>*{flex:1}label{font-size:12px;color:var(--mu)}
+table{width:100%;border-collapse:collapse}td,th{padding:6px 4px;text-align:left;border-bottom:1px solid var(--bd)}th{font-size:12px;color:var(--mu)}
+.sc{overflow-x:auto}td input{width:64px;padding:7px 4px;text-align:center}
+.bar{height:10px;background:var(--ac);border-radius:5px}.mu{color:var(--mu)}.err{color:var(--rd)}
+textarea{min-height:300px;font-family:monospace}
+</style></head><body>
+<header><b id="ttl">Cooperativa</b><nav id="nav"></nav></header>
+<main id="app"></main>
+<script type="text/plain" id="sqltxt">
+-- COOPERATIVA DE LIVROS — rode TUDO de uma vez no SQL Editor do Supabase (botão Run)
+
+create table colportores(id uuid primary key default gen_random_uuid(), nome text not null, ativo boolean not null default true, criado_em timestamptz default now());
+create table fechamentos(id uuid primary key default gen_random_uuid(), data date unique not null, status text not null default 'fechado', fechado_por text, fechado_em timestamptz default now());
+create table movimentacoes(
+  id uuid primary key default gen_random_uuid(), data date not null,
+  tipo text not null check (tipo in ('estoque_inicial','entrada','entrega','devolucao','perda','ajuste')),
+  quantidade int not null check (tipo='ajuste' or quantidade>0),
+  colportor_id uuid references colportores, responsavel text, observacao text,
+  criado_por text default (auth.jwt()->>'email'),
+  fechamento_id uuid references fechamentos on delete cascade, criado_em timestamptz default now());
+create table resultados_diarios(
+  id uuid primary key default gen_random_uuid(),
+  fechamento_id uuid not null references fechamentos on delete cascade,
+  colportor_id uuid not null references colportores,
+  recebidos int not null default 0 check (recebidos>=0), semeados int not null default 0 check (semeados>=0),
+  devolvidos int not null default 0 check (devolvidos>=0), contatos int not null default 0 check (contatos>=0),
+  indicacoes int not null default 0 check (indicacoes>=0), unique(fechamento_id, colportor_id));
+create table configuracoes(id int primary key default 1 check (id=1), cooperativa text default 'Cooperativa de Londrina', estoque_minimo int default 20);
+insert into configuracoes default values;
+-- rascunho do Fechamento do Dia: salvo automaticamente enquanto você digita
+create table rascunhos(data date primary key, itens jsonb not null, atualizado_por text, atualizado_em timestamptz default now());
+
+-- Usuários: o PRIMEIRO cadastro vira administrador; os demais ficam aguardando aprovação
+create table perfis(id uuid primary key references auth.users on delete cascade, email text, admin boolean not null default false, aprovado boolean not null default false, criado_em timestamptz default now());
+create function public.novo_usuario() returns trigger language plpgsql security definer set search_path=public as $$
+declare primeiro boolean;
+begin select count(*)=0 into primeiro from perfis;
+  insert into perfis(id,email,admin,aprovado) values (new.id,new.email,primeiro,primeiro); return new; end $$;
+create trigger ao_criar_usuario after insert on auth.users for each row execute function public.novo_usuario();
+create function public.aprovado() returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from perfis where id=auth.uid() and aprovado) $$;
+create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from perfis where id=auth.uid() and aprovado and admin) $$;
+
+-- Estoque = única fonte da verdade (perda de colportor não mexe no estoque: o kit já saiu)
+create view estoque_atual with (security_invoker=true) as
+select coalesce(sum(case when tipo in ('estoque_inicial','entrada','devolucao','ajuste') then quantidade
+  when tipo='entrega' then -quantidade when tipo='perda' and colportor_id is null then -quantidade else 0 end),0) as estoque
+from movimentacoes;
+
+-- Fechar Dia: tudo ou nada (transação única)
+create function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$
+declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int;
+begin
+  if exists(select 1 from fechamentos where data=p_data) then
+    if not p_reabrir then raise exception 'Este dia já está fechado. Reabra para corrigir.'; end if;
+    delete from fechamentos where data=p_data;
+  end if;
+  insert into fechamentos(data,fechado_por) values (p_data, auth.jwt()->>'email') returning id into fid;
+  for it in select * from jsonb_array_elements(p_itens) loop
+    rec:=coalesce((it->>'recebidos')::int,0); sem:=coalesce((it->>'semeados')::int,0); dev:=coalesce((it->>'devolvidos')::int,0);
+    select coalesce(sum(case tipo when 'entrega' then quantidade else -quantidade end),0) into posse
+      from movimentacoes where colportor_id=(it->>'colportor_id')::uuid and data<p_data and tipo in ('entrega','devolucao','perda');
+    posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id
+      where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);
+    if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha (%).',posse+rec; end if;
+    insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)
+      values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));
+    if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
+    if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
+  end loop;
+  select estoque into est from estoque_atual;
+  if est<0 then raise exception 'Estoque insuficiente: faltam % kits.',-est; end if;
+end $$;
+
+-- Segurança: só usuários logados E aprovados enxergam ou alteram os dados
+do $$ declare t text; begin
+  foreach t in array array['colportores','fechamentos','movimentacoes','resultados_diarios','configuracoes','rascunhos'] loop
+    execute format('alter table %I enable row level security',t);
+    execute format('create policy acesso on %I for all to authenticated using (public.aprovado()) with check (public.aprovado())',t);
+  end loop; end $$;
+alter table perfis enable row level security;
+create policy ver_perfil on perfis for select to authenticated using (id=auth.uid() or public.eh_admin());
+create policy admin_edita on perfis for update to authenticated using (public.eh_admin()) with check (public.eh_admin());
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+// >>> COLE AQUI os dados do seu projeto Supabase (Project Settings > API)
+(function(){const m=location.hash.match(/^#cfg=(.+)$/);if(m){try{const o=JSON.parse(atob(m[1]));localStorage.setItem('sbu',o.u);localStorage.setItem('sbk',o.k)}catch(e){}history.replaceState(null,'',location.pathname)}})();
+const CFG0={url:'',key:''}; // opcional: cole aqui a URL e a chave para valer em todos os aparelhos
+let SB_URL='';try{SB_URL=new URL((localStorage.getItem('sbu')||CFG0.url).trim()).origin}catch(e){}
+const SB_KEY=(localStorage.getItem('sbk')||CFG0.key).trim();
+const OK=SB_URL.startsWith('https://'), $=s=>document.querySelector(s);
+const sb=supabase.createClient(OK?SB_URL:'https://x.supabase.co',OK?SB_KEY:'x');
+const hoje=()=>new Date().toLocaleDateString('sv',{timeZone:'America/Sao_Paulo'});
+const br=d=>d.split('-').reverse().join('/'), S=(a,k)=>a.reduce((s,x)=>s+(+x[k]||0),0);
+const add=(d,n)=>{const t=new Date(d+'T12:00:00');t.setDate(t.getDate()+n);return t.toISOString().slice(0,10)};
+const seg=d=>{const t=new Date(d+'T12:00:00');return add(d,-((t.getDay()+6)%7))};
+let D={};
+async function load0(){
+ const [c,m,r,cf]=await Promise.all([sb.from('colportores').select('*').order('nome'),
+  sb.from('movimentacoes').select('*').order('data',{ascending:false}).order('criado_em',{ascending:false}),
+  sb.from('resultados_diarios').select('*,fechamentos(data)'),sb.from('configuracoes').select('*').eq('id',1).maybeSingle()]);
+ D={c:c.data||[],m:m.data||[],r:(r.data||[]).map(x=>({...x,data:x.fechamentos.data})),cf:cf.data||{cooperativa:'Cooperativa de Londrina',estoque_minimo:20}};
+ $('#ttl').textContent=D.cf.cooperativa}
+async function lp(){const{data}=await sb.from('perfis').select('*').order('criado_em');D.p=data||[]}
+async function load(){await load0();await lp()}
+const est=f=>D.m.filter(f).reduce((s,x)=>s+(x.tipo=='ajuste'?x.quantidade:x.tipo=='perda'&&x.colportor_id?0:({estoque_inicial:1,entrada:1,devolucao:1,entrega:-1,perda:-1}[x.tipo])*x.quantidade),0);
+const nome=id=>(D.c.find(x=>x.id==id)||{}).nome||'—';
+const posse=(id,antes='9')=>D.m.filter(x=>x.colportor_id==id&&x.data<antes).reduce((s,x)=>s+(x.tipo=='entrega'?x.quantidade:['devolucao','perda'].includes(x.tipo)?-x.quantidade:0),0)-S(D.r.filter(x=>x.colportor_id==id&&x.data<antes),'semeados');
+const R=(a,b,id)=>D.r.filter(x=>x.data>=a&&x.data<=b&&(!id||x.colportor_id==id));
+const card=(l,v,w)=>`<div class="c k ${w?'warn':''}"><small>${l}</small><b>${v}</b></div>`;
+const pages=['Dashboard','Fechamento do Dia','Colportores','Estoque','Movimentações','Relatórios','Histórico','Configurações'];
+const slug=['dash','fechar','colp','estoque','mov','rel','hist','cfg'];
+function msg(t,e){alert(t)}
+function rel(d){
+ const rs=R(d,d), ms=D.m.filter(x=>x.data==d), ini=est(x=>x.data<d), en=est(x=>x.data==d&&['entrada','estoque_inicial'].includes(x.tipo)),
+  sa=S(ms.filter(x=>x.tipo=='entrega'),'quantidade'), dv=S(ms.filter(x=>x.tipo=='devolucao'),'quantidade'), at=est(x=>x.data<=d), aj=at-(ini+en-sa+dv);
+ const at_=rs.filter(x=>x.recebidos+x.semeados+x.devolvidos+x.contatos>0);
+ return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} — ${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`}
+const V={
+dash(){const h=hoje(),s=seg(h),m=h.slice(0,8)+'01',a=est(()=>1),w=a<=D.cf.estoque_minimo,t=R(h,h);
+ return `<h2>Início</h2>${w?`<div class="c k warn"><b style="font-size:16px">⚠ Estoque baixo: ${a} kits (mínimo ${D.cf.estoque_minimo})</b></div>`:''}
+ <div class="g">${card('Estoque atual',a,w)}${card('Entregues hoje',S(t,'recebidos'))}${card('Semeados hoje',S(t,'semeados'))}${card('Devolvidos hoje',S(t,'devolvidos'))}${card('Colportores ativos',D.c.filter(x=>x.ativo).length)}${card('Semeados na semana',S(R(s,h),'semeados'))}${card('Semeados no mês',S(R(m,h),'semeados'))}</div>
+ <button onclick="location.hash='fechar'">Fazer fechamento do dia</button>`},
+fechar(d=hoje()){const ex=D.r.some(x=>x.data==d),at=D.c.filter(x=>x.ativo);
+ return `<h2>Fechamento do Dia</h2><div class="c"><label>Data</label><input type="date" id="fd" value="${d}" onchange="draw('fechar',this.value)">
+ ${ex?'<p class="mu">Dia já fechado. Ao salvar, ele será reaberto e recalculado.</p>':''}</div>
+ <div class="c sc"><table><tr><th>Colportor</th><th>Receb.</th><th>Semeou</th><th>Devolv.</th><th>Contatos</th><th>Indic.</th></tr>
+ ${at.map(c=>{const r=D.r.find(x=>x.data==d&&x.colportor_id==c.id)||{};return `<tr data-id="${c.id}"><td>${c.nome}<br><small class="mu">com ele: ${posse(c.id,d)}</small></td>${['recebidos','semeados','devolvidos','contatos','indicacoes'].map(k=>`<td><input type="number" min="0" inputmode="numeric" data-k="${k}" value="${r[k]||0}" oninput="tot();rasc()"></td>`).join('')}</tr>`}).join('')||'<tr><td>Cadastre colportores primeiro.</td></tr>'}
+ <tr><th>Total</th><th id="t0"></th><th id="t1"></th><th id="t2"></th><th id="t3"></th><th id="t4"></th></tr></table></div>
+ <small id="sv" class="mu"></small><div style="height:8px"></div><button onclick="fechar()">Fechar Dia</button>`},
+colp(){return `<h2>Colportores</h2><div class="c"><div class="r"><input id="cn" placeholder="Nome do colportor"><button style="max-width:110px" onclick="addC()">Cadastrar</button></div></div>
+ ${D.c.map(c=>{const r=R('0','9',c.id);return `<div class="c"><b>${c.nome}</b> <span class="mu">${c.ativo?'ativo':'inativo'}</span>
+ <p class="mu" style="margin:4px 0">Recebeu ${S(r,'recebidos')} · Devolveu ${S(r,'devolvidos')} · Semeou ${S(r,'semeados')} · Com ele: ${posse(c.id)}</p>
+ <button class="s" onclick="tgl('${c.id}',${!c.ativo})">${c.ativo?'Inativar':'Reativar'}</button></div>`}).join('')}`},
+estoque(){const f=t=>est(x=>x.tipo==t);const out=S(D.m.filter(x=>x.tipo=='entrega'),'quantidade'),pc=D.c.reduce((s,c)=>s+posse(c.id),0);
+ return `<h2>Estoque</h2><div class="g">${card('Estoque atual',est(()=>1),est(()=>1)<=D.cf.estoque_minimo)}${card('Estoque inicial',f('estoque_inicial'))}${card('Entradas',f('entrada'))}${card('Entregues',out)}${card('Devolvidos',S(D.m.filter(x=>x.tipo=='devolucao'),'quantidade'))}${card('Semeados',S(D.r,'semeados'))}${card('Com colportores agora',pc)}${card('Perdas/danos',S(D.m.filter(x=>x.tipo=='perda'),'quantidade'))}</div>`},
+mov(){return `<h2>Movimentações</h2><div class="c"><div class="r"><div><label>Data</label><input type="date" id="md" value="${hoje()}"></div>
+ <div><label>Tipo</label><select id="mt"><option value="estoque_inicial">Estoque inicial</option><option value="entrada">Entrada</option><option value="entrega">Saída (entrega)</option><option value="devolucao">Devolução</option><option value="perda">Perda/dano</option><option value="ajuste">Ajuste (+/−)</option></select></div></div>
+ <div class="r"><div><label>Quantidade</label><input type="number" id="mq" inputmode="numeric"></div><div><label>Colportor (opcional)</label><select id="mc"><option value="">—</option>${D.c.map(c=>`<option value="${c.id}">${c.nome}</option>`)}</select></div></div>
+ <div class="r"><input id="mr" placeholder="Responsável"><input id="mo" placeholder="Observação"></div><button onclick="addM()">Registrar</button></div>
+ <div class="c sc"><table><tr><th>Data</th><th>Tipo</th><th>Qtd</th><th>Quem</th><th>Obs</th></tr>${D.m.slice(0,100).map(x=>`<tr><td>${br(x.data)}</td><td>${x.tipo}</td><td>${x.quantidade}</td><td>${x.colportor_id?nome(x.colportor_id):x.responsavel||''}</td><td>${x.observacao||''}</td></tr>`).join('')}</table></div>
+ <p class="mu">Erros se corrigem com um lançamento de Ajuste, mantendo o histórico completo.</p>`},
+rel(d=hoje()){return `<h2>Relatórios</h2><div class="c"><label>Data</label><input type="date" id="rd" value="${d}" onchange="draw('rel',this.value)"></div>
+ <button onclick="$('#rt').value=rel($('#rd').value)">Gerar relatório</button><div style="height:10px"></div>
+ <textarea id="rt" readonly></textarea><div style="height:10px"></div><button class="s" onclick="cp()">Copiar para WhatsApp</button>`},
+hist(){const h=hoje();return `<h2>Histórico</h2><div class="c"><div class="r"><div><label>De</label><input type="date" id="h1" value="${add(h,-6)}" onchange="hs()"></div><div><label>Até</label><input type="date" id="h2" value="${h}" onchange="hs()"></div></div>
+ <div class="r"><button class="s" onclick="pr('d')">Hoje</button><button class="s" onclick="pr('s')">Semana</button><button class="s" onclick="pr('m')">Mês</button></div>
+ <label>Colportor</label><select id="h3" onchange="hs()"><option value="">Todos</option>${D.c.map(c=>`<option value="${c.id}">${c.nome}</option>`)}</select></div><div id="hr"></div>`}
+};
+function hs(){const a=$('#h1').value,b=$('#h2').value,id=$('#h3').value,r=R(a,b,id),n=new Set(r.filter(x=>x.semeados+x.recebidos>0).map(x=>x.colportor_id)).size;
+ const rk=D.c.map(c=>({n:c.nome,v:S(r.filter(x=>x.colportor_id==c.id),'semeados')})).filter(x=>x.v>0).sort((x,y)=>y.v-x.v),mx=rk[0]?rk[0].v:1;
+ const dias={};r.forEach(x=>dias[x.data]=(dias[x.data]||0)+x.semeados);const dk=Object.keys(dias).sort(),dm=Math.max(1,...Object.values(dias));
+ $('#hr').innerHTML=`<div class="g">${card('Semeados',S(r,'semeados'))}${card('Distribuídos',S(r,'recebidos'))}${card('Devolvidos',S(r,'devolvidos'))}${card('Contatos',S(r,'contatos'))}${card('Indicações',S(r,'indicacoes'))}${card('Média semeados/colportor',n?(S(r,'semeados')/n).toFixed(1):0)}${card('Estoque atual',est(()=>1))}</div>
+ <div class="c"><b>Semeados por dia</b>${dk.map(k=>`<div class="r" style="align-items:center"><small style="flex:0 0 70px">${br(k).slice(0,5)}</small><div class="bar" style="flex:none;width:${dias[k]/dm*100}%;min-width:4px"></div><small>${dias[k]}</small></div>`).join('')||'<p class="mu">Sem dados no período.</p>'}</div>
+ <div class="c"><b>Ranking</b>${rk.map((x,i)=>`<div style="margin:8px 0">${i+1}. ${x.n} — ${x.v}<div class="bar" style="width:${x.v/mx*100}%"></div></div>`).join('')||'<p class="mu">Sem dados.</p>'}</div>`}
+function pr(t){const h=hoje();$('#h1').value=t=='d'?h:t=='s'?seg(h):h.slice(0,8)+'01';$('#h2').value=h;hs()}
+V.cfg=()=>`<h2>Configurações</h2><div class="c"><label>Nome da cooperativa</label><input id="cn2" value="${D.cf.cooperativa}"><label>Estoque mínimo (alerta)</label><input id="cm" type="number" value="${D.cf.estoque_minimo}"><div style="height:10px"></div><button onclick="svCfg()">Salvar</button></div>
+<div class="c"><b>Minha conta</b><p class="mu">${ME.email}${ME.admin?' · administrador':''}</p><button class="s" onclick="sb.auth.signOut().then(()=>location.reload())">Sair</button><div style="height:8px"></div><button class="s" onclick="lk()">Copiar link para configurar outro aparelho</button></div>
+${ME.admin?`<div class="c"><b>Usuários</b>${D.p.map(u=>`<div class="r" style="align-items:center"><span>${u.email}<br><small class="mu">${u.admin?'administrador · ':''}${u.aprovado?'aprovado':'aguardando aprovação'}</small></span>${u.id==ME.id?'':`<button class="s" onclick="ap('${u.id}',${!u.aprovado})">${u.aprovado?'Bloquear':'Aprovar'}</button>`}</div>`).join('')}</div>`:''}`;
+function tot(){['recebidos','semeados','devolvidos','contatos','indicacoes'].forEach((k,i)=>$('#t'+i).textContent=[...document.querySelectorAll(`[data-k=${k}]`)].reduce((s,x)=>s+(+x.value||0),0))}
+async function go(p){const{error}=await p;if(error){alert(error.message);return false}await load();draw();return true}
+async function fechar(){const it=[...document.querySelectorAll('tr[data-id]')].map(tr=>{const o={colportor_id:tr.dataset.id};tr.querySelectorAll('input').forEach(i=>o[i.dataset.k]=+i.value||0);return o});
+ const d=$('#fd').value,ex=D.r.some(x=>x.data==d);if(ex&&!confirm('Dia já fechado. Reabrir e recalcular?'))return;
+ const{error}=await sb.rpc('fechar_dia',{p_data:d,p_itens:it,p_reabrir:ex});if(error)return alert(error.message);await sb.from('rascunhos').delete().eq('data',d);await load();location.hash='rel';draw('rel',d)}
+const addC=()=>$('#cn').value.trim()&&go(sb.from('colportores').insert({nome:$('#cn').value.trim()}));
+const tgl=(id,v)=>go(sb.from('colportores').update({ativo:v}).eq('id',id));
+const addM=()=>{const t=$('#mt').value,q=+$('#mq').value;if(!q||(t!='ajuste'&&q<0))return alert('Informe a quantidade.');go(sb.from('movimentacoes').insert({data:$('#md').value,tipo:t,quantidade:q,colportor_id:$('#mc').value||null,responsavel:$('#mr').value||ME.email,observacao:$('#mo').value}))};
+const svCfg=()=>go(sb.from('configuracoes').update({cooperativa:$('#cn2').value,estoque_minimo:+$('#cm').value}).eq('id',1));
+const cp=()=>{$('#rt').select();navigator.clipboard.writeText($('#rt').value).then(()=>alert('Copiado!'))};
+function draw(p,arg){p=p||location.hash.slice(1)||'dash';if(!V[p])p='dash';$('#nav').innerHTML=slug.map((s,i)=>`<a href="#${s}" class="${s==p?'on':''}">${pages[i]}</a>`).join('');
+ $('#app').innerHTML=V[p](arg);if(p=='fechar'){tot();lr(arg||hoje())}if(p=='hist')hs()}
+addEventListener('hashchange',()=>draw());
+let ME={},rt;
+const lk=()=>navigator.clipboard.writeText(location.origin+location.pathname+'#cfg='+btoa(JSON.stringify({u:SB_URL,k:SB_KEY}))).then(()=>alert('Link copiado! Abra-o no outro aparelho para configurar sozinho.'));
+function setup(){$('#nav').innerHTML='';$('#ttl').textContent='Configuração inicial (só uma vez)';
+ $('#app').innerHTML=`<div class="c"><b>Passo 1.</b> Crie uma conta grátis em <b>supabase.com</b> e um projeto novo (região South America). Abra <b>SQL Editor > New query</b>, cole o código abaixo e clique em <b>Run</b>.<div style="height:8px"></div><textarea id="sq" readonly style="min-height:140px"></textarea><div style="height:8px"></div><button class="s" onclick="$('#sq').select();navigator.clipboard.writeText($('#sq').value).then(()=>alert('Copiado!'))">Copiar SQL</button></div>
+ <div class="c"><b>Passo 2.</b> Em <b>Authentication > Sign In / Providers > Email</b>, desligue <b>Confirm email</b> (assim o cadastro entra direto).</div>
+ <div class="c"><b>Passo 3.</b> Em <b>Project Settings > API</b>, copie e cole aqui:<div style="height:8px"></div><input id="su" placeholder="Project URL (https://...supabase.co)"><div style="height:8px"></div><input id="sk" placeholder="Chave anon / publishable"><div style="height:10px"></div><button onclick="const u=$('#su').value.trim(),k=$('#sk').value.trim();if(!u.startsWith('https://')||k.length<20)return alert('Confira a URL e a chave.');localStorage.setItem('sbu',u);localStorage.setItem('sbk',k);location.reload()">Salvar e continuar</button></div>
+ <p class="mu">Depois, crie sua conta na tela seguinte: o primeiro cadastro vira administrador. Em Configurações você copia um link que configura os outros aparelhos sozinho.</p>`;
+ $('#sq').value=$('#sqltxt').textContent.trim()}
+const ap=(id,v)=>go(sb.from('perfis').update({aprovado:v}).eq('id',id));
+function rows(){return [...document.querySelectorAll('tr[data-id]')].map(tr=>{const o={colportor_id:tr.dataset.id};tr.querySelectorAll('input').forEach(i=>o[i.dataset.k]=+i.value||0);return o})}
+function rasc(){clearTimeout(rt);const s=$('#sv');if(s)s.textContent='Salvando rascunho…';rt=setTimeout(async()=>{const d=$('#fd')&&$('#fd').value;if(!d)return;
+ const{error}=await sb.from('rascunhos').upsert({data:d,itens:rows(),atualizado_por:ME.email,atualizado_em:new Date().toISOString()});
+ if($('#sv'))$('#sv').textContent=error?'Erro ao salvar rascunho':'Rascunho salvo ✓'},600)}
+async function lr(d){const{data}=await sb.from('rascunhos').select('*').eq('data',d).maybeSingle();if(!data||!$('#fd')||$('#fd').value!=d)return;
+ data.itens.forEach(o=>{const tr=document.querySelector(`tr[data-id="${o.colportor_id}"]`);if(tr)tr.querySelectorAll('input').forEach(i=>i.value=o[i.dataset.k]||0)});tot();$('#sv').textContent='Rascunho recuperado ✓'}
+function authUI(m='in'){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>${m=='in'?'Entrar':'Criar conta'}</h2><div class="c"><div class="r"><button class="${m=='in'?'':'s'}" onclick="authUI('in')">Entrar</button><button class="${m=='up'?'':'s'}" onclick="authUI('up')">Criar conta</button></div>
+ <input id="le" type="email" placeholder="E-mail" autocomplete="email"><div style="height:8px"></div><input id="lp" type="password" placeholder="Senha (mínimo 6 caracteres)" autocomplete="${m=='in'?'current-password':'new-password'}"><div style="height:10px"></div>
+ <button onclick="doAuth('${m}')">${m=='in'?'Entrar':'Criar conta'}</button>${m=='up'?'<p class="mu">O primeiro cadastro vira administrador. Os demais precisam ser aprovados por ele.</p>':''}</div>`}
+async function doAuth(m){const e=$('#le').value.trim(),p=$('#lp').value;
+ const r=m=='in'?await sb.auth.signInWithPassword({email:e,password:p}):await sb.auth.signUp({email:e,password:p});
+ if(r.error)return alert(r.error.message.includes('Invalid login')?'E-mail ou senha incorretos.':r.error.message);
+ if(m=='up'&&!r.data.session)return alert('Conta criada! Confirme pelo link enviado ao seu e-mail e depois entre.');
+ location.reload()}
+async function start(){
+ if(!OK){setup();return}
+ const{data}=await sb.auth.getSession();if(!data.session)return authUI();
+ const u=data.session.user,{data:p}=await sb.from('perfis').select('*').eq('id',u.id).maybeSingle();
+ ME={id:u.id,email:u.email,admin:!!(p&&p.admin)};
+ if(!p||!p.aprovado){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>Aguardando aprovação</h2><div class="c"><p>Sua conta (${u.email}) foi criada, mas o administrador ainda precisa aprová-la.</p><button onclick="location.reload()">Verificar de novo</button><div style="height:8px"></div><button class="s" onclick="sb.auth.signOut().then(()=>location.reload())">Sair</button></div>`;return}
+ await load();draw()}
+start();
+</script></body></html>
