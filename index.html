@@ -55,7 +55,8 @@ create function public.aprovado() returns boolean language sql stable security d
 create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from perfis where id=auth.uid() and aprovado and admin)$$;
 
 -- Estoque - única fonte da verdade
-create or replace view estoque_atual with (security_invoker=true) as
+drop view if exists estoque_atual;
+create view estoque_atual with (security_invoker=true) as
 select coalesce(sum(
   case 
     when tipo in ('estoque_inicial', 'entrada', 'devolucao', 'ajuste') then coalesce(quantidade, 0)
@@ -102,7 +103,7 @@ async function load0(){
 async function lp(){const{data}=await sb.from('perfis').select('*').order('criado_em');D.p=data||[]}
 async function load(){await load0();await lp()}
 
-// Cálculo corrigido do Estoque Atual da Cooperativa
+// Cálculo do Estoque da Cooperativa com verificações seguras
 const est = f => D.m.filter(f).reduce((s, x) => {
   const qtd = Number(x.quantidade) || 0;
   if (x.tipo === 'ajuste') return s + qtd;
@@ -113,7 +114,7 @@ const est = f => D.m.filter(f).reduce((s, x) => {
 
 const nome = id => (D.c.find(x => x.id == id) || {}).nome || '—';
 
-// Posse real com o colportor = (Entregues - Devoluções - Perdas) - Semeados
+// Posse com colportor
 const posse = (id, antes = '9999-12-31') => {
   const movs = D.m.filter(x => x.colportor_id == id && x.data < antes);
   const recebidos = S(movs.filter(x => x.tipo === 'entrega'), 'quantidade');
@@ -127,11 +128,20 @@ const card=(l,v,w)=>`<div class="c k ${w?'warn':''}"><small>${l}</small><b>${v}<
 const pages=['Dashboard','Fechamento do Dia','Colportores','Estoque','Movimentações','Relatórios','Histórico','Configurações'];
 const slug=['dash','fechar','colp','estoque','mov','rel','hist','cfg'];
 function msg(t,e){alert(t)}
+
 function rel(d){
- const rs=R(d,d), ms=D.m.filter(x=>x.data==d), ini=est(x=>x.data<d), en=est(x=>x.data==d&&['entrada','estoque_inicial'].includes(x.tipo)),
- sa=S(ms.filter(x=>x.tipo=='entrega'),'quantidade'), dv=S(ms.filter(x=>x.tipo=='devolucao'),'quantidade'), at=est(x=>x.data<=d), aj=at-(ini+en-sa+dv);
- const at_=rs.filter(x=>x.recebidos+x.semeados+x.devolvidos+x.contatos>0);
- return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} —${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`}
+ const rs=R(d,d), ms=D.m.filter(x=>x.data==d);
+ const ini=est(x=>x.data<d);
+ const en=S(ms.filter(x=>['entrada','estoque_inicial'].includes(x.tipo)),'quantidade');
+ const sa=S(ms.filter(x=>x.tipo=='entrega'||x.tipo=='saida'),'quantidade');
+ const dv=S(ms.filter(x=>x.tipo=='devolucao'),'quantidade');
+ const at=est(x=>x.data<=d);
+ const aj=at-(ini+en-sa+dv);
+ const at_=rs.filter(x=>(+x.recebidos||0)+(+x.semeados||0)+(+x.devolvidos||0)+(+x.contatos||0)>0);
+
+ return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} —${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`;
+}
+
 const V={
 dash(){const h=hoje(),s=seg(h),m=h.slice(0,8)+'01',a=est(()=>1),w=a<=D.cf.estoque_minimo,t=R(h,h);
  return `<h2>Início</h2>${w?`<div class="c k warn"><b style="font-size:16px">⚠ Estoque baixo: ${a} kits (mínimo ${D.cf.estoque_minimo})</b></div>`:''}
