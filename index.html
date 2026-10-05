@@ -84,6 +84,7 @@ begin
     insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)
       values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));
     if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
+  if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid);
     if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
   end loop;
   select estoque into est from estoque_atual;
