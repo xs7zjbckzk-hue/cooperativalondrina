@@ -61,10 +61,14 @@ create function public.eh_admin() returns boolean language sql stable security d
 
 -- Estoque = única fonte da verdade (perda de colportor não mexe no estoque: o kit já saiu)
 create view estoque_atual with (security_invoker=true) as
-select coalesce(sum(case when tipo in ('estoque_inicial','entrada','devolucao','ajuste') then quantidade
-  when tipo='entrega' then -quantidade when tipo='perda' and colportor_id is null then -quantidade else 0 end),0) as estoque
+select coalesce(sum(
+  case 
+    when tipo in ('estoque_inicial', 'entrada', 'devolucao', 'ajuste') then coalesce(quantidade, 0)
+    when tipo in ('entrega', 'saida', 'perda') then -coalesce(quantidade, 0)
+    else 0
+  end
+), 0) as estoque
 from movimentacoes;
-
 -- Fechar Dia: tudo ou nada (transação única)
 create function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$
 declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int;
