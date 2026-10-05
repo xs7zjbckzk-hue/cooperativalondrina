@@ -59,7 +59,7 @@ create function public.aprovado() returns boolean language sql stable security d
 create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$
   select exists(select 1 from perfis where id=auth.uid() and aprovado and admin) $$;
 
--- Estoque = única fonte da verdade (perda de colportor não mexe no estoque: o kit já saiu)
+-- Estoque - única fonte da verdade
 create view estoque_atual with (security_invoker=true) as
 select coalesce(sum(
   case 
