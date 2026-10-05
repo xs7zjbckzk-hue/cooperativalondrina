@@ -30,7 +30,7 @@ create table colportores(id uuid primary key default gen_random_uuid(), nome tex
 create table fechamentos(id uuid primary key default gen_random_uuid(), data date unique not null, status text not null default 'fechado', fechado_por text, fechado_em timestamptz default now());
 create table movimentacoes(
   id uuid primary key default gen_random_uuid(), data date not null,
-  tipo text not null check (tipo in ('estoque_inicial','entrada','entrega','devolucao','perda','ajuste')),
+  tipo text not null check (tipo in ('estoque_inicial','entrada','entrega','saida','devolucao','perda','ajuste')),
   quantidade int not null check (tipo='ajuste' or quantidade>0),
   colportor_id uuid references colportores, responsavel text, observacao text,
   criado_por text default (auth.jwt()->>'email'),
@@ -43,24 +43,19 @@ create table resultados_diarios(
   devolvidos int not null default 0 check (devolvidos>=0), contatos int not null default 0 check (contatos>=0),
   indicacoes int not null default 0 check (indicacoes>=0), unique(fechamento_id, colportor_id));
 create table configuracoes(id int primary key default 1 check (id=1), cooperativa text default 'Cooperativa de Londrina', estoque_minimo int default 20);
-insert into configuracoes default values;
+insert into configuracoes default values on conflict (id) do nothing;
 -- rascunho do Fechamento do Dia: salvo automaticamente enquanto você digita
 create table rascunhos(data date primary key, itens jsonb not null, atualizado_por text, atualizado_em timestamptz default now());
 
 -- Usuários: o PRIMEIRO cadastro vira administrador; os demais ficam aguardando aprovação
 create table perfis(id uuid primary key references auth.users on delete cascade, email text, admin boolean not null default false, aprovado boolean not null default false, criado_em timestamptz default now());
-create function public.novo_usuario() returns trigger language plpgsql security definer set search_path=public as $$
-declare primeiro boolean;
-begin select count(*)=0 into primeiro from perfis;
-  insert into perfis(id,email,admin,aprovado) values (new.id,new.email,primeiro,primeiro); return new; end $$;
+create function public.novo_usuario() returns trigger language plpgsql security definer set search_path=public as $$ declare primeiro boolean; begin select count(*)=0 into primeiro from perfis;   insert into perfis(id,email,admin,aprovado) values (new.id,new.email,primeiro,primeiro); return new; end $$;
 create trigger ao_criar_usuario after insert on auth.users for each row execute function public.novo_usuario();
-create function public.aprovado() returns boolean language sql stable security definer set search_path=public as $$
-  select exists(select 1 from perfis where id=auth.uid() and aprovado) $$;
-create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$
-  select exists(select 1 from perfis where id=auth.uid() and aprovado and admin) $$;
+create function public.aprovado() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from perfis where id=auth.uid() and aprovado)$$;
+create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from perfis where id=auth.uid() and aprovado and admin)$$;
 
 -- Estoque - única fonte da verdade
-create view estoque_atual with (security_invoker=true) as
+create or replace view estoque_atual with (security_invoker=true) as
 select coalesce(sum(
   case 
     when tipo in ('estoque_inicial', 'entrada', 'devolucao', 'ajuste') then coalesce(quantidade, 0)
@@ -69,48 +64,22 @@ select coalesce(sum(
   end
 ), 0) as estoque
 from movimentacoes;
+
 -- Fechar Dia: tudo ou nada (transação única)
-create function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$
-declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int;
-begin
-  if exists(select 1 from fechamentos where data=p_data) then
-    if not p_reabrir then raise exception 'Este dia já está fechado. Reabra para corrigir.'; end if;
-    delete from fechamentos where data=p_data;
-  end if;
-  insert into fechamentos(data,fechado_por) values (p_data, auth.jwt()->>'email') returning id into fid;
-  for it in select * from jsonb_array_elements(p_itens) loop
-    rec:=coalesce((it->>'recebidos')::int,0); sem:=coalesce((it->>'semeados')::int,0); dev:=coalesce((it->>'devolvidos')::int,0);
-    select coalesce(sum(case tipo when 'entrega' then quantidade else -quantidade end),0) into posse
-      from movimentacoes where colportor_id=(it->>'colportor_id')::uuid and data<p_data and tipo in ('entrega','devolucao','perda');
-    posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id
-      where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);
-    if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha (%).',posse+rec; end if;
-    insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)
-      values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));
-    if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
-  if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid);
-    if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
-  end loop;
-  select estoque into est from estoque_atual;
-  if est<0 then raise exception 'Estoque insuficiente: faltam % kits.',-est; end if;
-end $$;
+create or replace function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$ declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int; begin   if exists(select 1 from fechamentos where data=p_data) then     if not p_reabrir then raise exception 'Este dia já está fechado. Reabra para corrigir.'; end if;     delete from fechamentos where data=p_data;   end if;   insert into fechamentos(data,fechado_por) values (p_data, auth.jwt()->>'email') returning id into fid;   for it in select * from jsonb_array_elements(p_itens) loop     rec:=coalesce((it->>'recebidos')::int,0); sem:=coalesce((it->>'semeados')::int,0); dev:=coalesce((it->>'devolvidos')::int,0);     select coalesce(sum(case tipo when 'entrega' then quantidade else -quantidade end),0) into posse       from movimentacoes where colportor_id=(it->>'colportor_id')::uuid and data<p_data and tipo in ('entrega','devolucao','perda');     posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id       where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);     if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha (\%).',posse+rec; end if;     insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)       values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));     if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;   end loop;   select estoque into est from estoque_atual;   if est<0 then raise exception 'Estoque insuficiente: faltam \% kits.',-est; end if; end $$;
 
 -- Segurança: só usuários logados E aprovados enxergam ou alteram os dados
-do $$ declare t text; begin
-  foreach t in array array['colportores','fechamentos','movimentacoes','resultados_diarios','configuracoes','rascunhos'] loop
-    execute format('alter table %I enable row level security',t);
-    execute format('create policy acesso on %I for all to authenticated using (public.aprovado()) with check (public.aprovado())',t);
-  end loop; end $$;
+do $$ declare t text; begin   foreach t in array array['colportores','fechamentos','movimentacoes','resultados_diarios','configuracoes','rascunhos'] loop     execute format('alter table \%I enable row level security',t);     execute format('drop policy if exists acesso on \%I',t);     execute format('create policy acesso on \%I for all to authenticated using (public.aprovado()) with check (public.aprovado())',t);   end loop; end $$;
 alter table perfis enable row level security;
+drop policy if exists ver_perfil on perfis;
 create policy ver_perfil on perfis for select to authenticated using (id=auth.uid() or public.eh_admin());
+drop policy if exists admin_edita on perfis;
 create policy admin_edita on perfis for update to authenticated using (public.eh_admin()) with check (public.eh_admin());
-
 </script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
-// >>> COLE AQUI os dados do seu projeto Supabase (Project Settings > API)
 (function(){const m=location.hash.match(/^#cfg=(.+)$/);if(m){try{const o=JSON.parse(atob(m[1]));localStorage.setItem('sbu',o.u);localStorage.setItem('sbk',o.k)}catch(e){}history.replaceState(null,'',location.pathname)}})();
-const CFG0={url:'',key:''}; // opcional: cole aqui a URL e a chave para valer em todos os aparelhos
+const CFG0={url:'',key:''};
 let SB_URL='';try{SB_URL=new URL((localStorage.getItem('sbu')||CFG0.url).trim()).origin}catch(e){}
 const SB_KEY=(localStorage.getItem('sbk')||CFG0.key).trim();
 const OK=SB_URL.startsWith('https://'), $=s=>document.querySelector(s);
@@ -120,17 +89,39 @@ const br=d=>d.split('-').reverse().join('/'), S=(a,k)=>a.reduce((s,x)=>s+(+x[k]|
 const add=(d,n)=>{const t=new Date(d+'T12:00:00');t.setDate(t.getDate()+n);return t.toISOString().slice(0,10)};
 const seg=d=>{const t=new Date(d+'T12:00:00');return add(d,-((t.getDay()+6)%7))};
 let D={};
+
 async function load0(){
- const [c,m,r,cf]=await Promise.all([sb.from('colportores').select('*').order('nome'),
+ const [c,m,r,cf]=await Promise.all([
+  sb.from('colportores').select('*').order('nome'),
   sb.from('movimentacoes').select('*').order('data',{ascending:false}).order('criado_em',{ascending:false}),
-  sb.from('resultados_diarios').select('*,fechamentos(data)'),sb.from('configuracoes').select('*').eq('id',1).maybeSingle()]);
- D={c:c.data||[],m:m.data||[],r:(r.data||[]).map(x=>({...x,data:x.fechamentos.data})),cf:cf.data||{cooperativa:'Cooperativa de Londrina',estoque_minimo:20}};
+  sb.from('resultados_diarios').select('*,fechamentos(data)'),
+  sb.from('configuracoes').select('*').eq('id',1).maybeSingle()
+ ]);
+ D={c:c.data||[],m:m.data||[],r:(r.data||[]).map(x=>({...x,data:x.fechamentos?x.fechamentos.data:''})),cf:cf.data||{cooperativa:'Cooperativa de Londrina',estoque_minimo:20}};
  $('#ttl').textContent=D.cf.cooperativa}
 async function lp(){const{data}=await sb.from('perfis').select('*').order('criado_em');D.p=data||[]}
 async function load(){await load0();await lp()}
-const est=f=>D.m.filter(f).reduce((s,x)=>s+(x.tipo=='ajuste'?x.quantidade:x.tipo=='perda'&&x.colportor_id?0:({estoque_inicial:1,entrada:1,devolucao:1,entrega:-1,perda:-1}[x.tipo])*x.quantidade),0);
-const nome=id=>(D.c.find(x=>x.id==id)||{}).nome||'—';
-const posse=(id,antes='9')=>D.m.filter(x=>x.colportor_id==id&&x.data<antes).reduce((s,x)=>s+(x.tipo=='entrega'?x.quantidade:['devolucao','perda'].includes(x.tipo)?-x.quantidade:0),0)-S(D.r.filter(x=>x.colportor_id==id&&x.data<antes),'semeados');
+
+// Cálculo corrigido do Estoque Atual da Cooperativa
+const est = f => D.m.filter(f).reduce((s, x) => {
+  const qtd = Number(x.quantidade) || 0;
+  if (x.tipo === 'ajuste') return s + qtd;
+  if (['estoque_inicial', 'entrada', 'devolucao'].includes(x.tipo)) return s + qtd;
+  if (['entrega', 'saida', 'perda'].includes(x.tipo)) return s - qtd;
+  return s;
+}, 0);
+
+const nome = id => (D.c.find(x => x.id == id) || {}).nome || '—';
+
+// Posse real com o colportor = (Entregues - Devoluções - Perdas) - Semeados
+const posse = (id, antes = '9999-12-31') => {
+  const movs = D.m.filter(x => x.colportor_id == id && x.data < antes);
+  const recebidos = S(movs.filter(x => x.tipo === 'entrega'), 'quantidade');
+  const devolvidos = S(movs.filter(x => x.tipo === 'devolucao' || x.tipo === 'perda'), 'quantidade');
+  const semeados = S(D.r.filter(x => x.colportor_id == id && x.data < antes), 'semeados');
+  return (recebidos - devolvidos) - semeados;
+};
+
 const R=(a,b,id)=>D.r.filter(x=>x.data>=a&&x.data<=b&&(!id||x.colportor_id==id));
 const card=(l,v,w)=>`<div class="c k ${w?'warn':''}"><small>${l}</small><b>${v}</b></div>`;
 const pages=['Dashboard','Fechamento do Dia','Colportores','Estoque','Movimentações','Relatórios','Histórico','Configurações'];
@@ -138,9 +129,9 @@ const slug=['dash','fechar','colp','estoque','mov','rel','hist','cfg'];
 function msg(t,e){alert(t)}
 function rel(d){
  const rs=R(d,d), ms=D.m.filter(x=>x.data==d), ini=est(x=>x.data<d), en=est(x=>x.data==d&&['entrada','estoque_inicial'].includes(x.tipo)),
-  sa=S(ms.filter(x=>x.tipo=='entrega'),'quantidade'), dv=S(ms.filter(x=>x.tipo=='devolucao'),'quantidade'), at=est(x=>x.data<=d), aj=at-(ini+en-sa+dv);
+ sa=S(ms.filter(x=>x.tipo=='entrega'),'quantidade'), dv=S(ms.filter(x=>x.tipo=='devolucao'),'quantidade'), at=est(x=>x.data<=d), aj=at-(ini+en-sa+dv);
  const at_=rs.filter(x=>x.recebidos+x.semeados+x.devolvidos+x.contatos>0);
- return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} — ${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`}
+ return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} —${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`}
 const V={
 dash(){const h=hoje(),s=seg(h),m=h.slice(0,8)+'01',a=est(()=>1),w=a<=D.cf.estoque_minimo,t=R(h,h);
  return `<h2>Início</h2>${w?`<div class="c k warn"><b style="font-size:16px">⚠ Estoque baixo: ${a} kits (mínimo ${D.cf.estoque_minimo})</b></div>`:''}
@@ -154,7 +145,7 @@ fechar(d=hoje()){const ex=D.r.some(x=>x.data==d),at=D.c.filter(x=>x.ativo);
  <tr><th>Total</th><th id="t0"></th><th id="t1"></th><th id="t2"></th><th id="t3"></th><th id="t4"></th></tr></table></div>
  <small id="sv" class="mu"></small><div style="height:8px"></div><button onclick="fechar()">Fechar Dia</button>`},
 colp(){return `<h2>Colportores</h2><div class="c"><div class="r"><input id="cn" placeholder="Nome do colportor"><button style="max-width:110px" onclick="addC()">Cadastrar</button></div></div>
- ${D.c.map(c=>{const r=R('0','9',c.id);return `<div class="c"><b>${c.nome}</b> <span class="mu">${c.ativo?'ativo':'inativo'}</span>
+ ${D.c.map(c=>{const r=R('0','9999-12-31',c.id);return `<div class="c"><b>${c.nome}</b> <span class="mu">${c.ativo?'ativo':'inativo'}</span>
  <p class="mu" style="margin:4px 0">Recebeu ${S(r,'recebidos')} · Devolveu ${S(r,'devolvidos')} · Semeou ${S(r,'semeados')} · Com ele: ${posse(c.id)}</p>
  <button class="s" onclick="tgl('${c.id}',${!c.ativo})">${c.ativo?'Inativar':'Reativar'}</button></div>`}).join('')}`},
 estoque(){const f=t=>est(x=>x.tipo==t);const out=S(D.m.filter(x=>x.tipo=='entrega'),'quantidade'),pc=D.c.reduce((s,c)=>s+posse(c.id),0);
@@ -163,7 +154,7 @@ mov(){return `<h2>Movimentações</h2><div class="c"><div class="r"><div><label>
  <div><label>Tipo</label><select id="mt"><option value="estoque_inicial">Estoque inicial</option><option value="entrada">Entrada</option><option value="entrega">Saída (entrega)</option><option value="devolucao">Devolução</option><option value="perda">Perda/dano</option><option value="ajuste">Ajuste (+/−)</option></select></div></div>
  <div class="r"><div><label>Quantidade</label><input type="number" id="mq" inputmode="numeric"></div><div><label>Colportor (opcional)</label><select id="mc"><option value="">—</option>${D.c.map(c=>`<option value="${c.id}">${c.nome}</option>`)}</select></div></div>
  <div class="r"><input id="mr" placeholder="Responsável"><input id="mo" placeholder="Observação"></div><button onclick="addM()">Registrar</button></div>
- <div class="c sc"><table><tr><th>Data</th><th>Tipo</th><th>Qtd</th><th>Quem</th><th>Obs</th></tr>${D.m.slice(0,100).map(x=>`<tr><td>${br(x.data)}</td><td>${x.tipo}</td><td>${x.quantidade}</td><td>${x.colportor_id?nome(x.colportor_id):x.responsavel||''}</td><td>${x.observacao||''}</td></tr>`).join('')}</table></div>
+ <div class="c sc"><table><tr><th>Data</th><th>Tipo</th><th>Qtd</th><th>Quem</th><th>Obs</th></tr>${D.m.slice(0,100).map(x=>`<tr><td>${br(x.data)}</td><td>${x.tipo}</td><td>${x.quantidade}</td><td>${x.colportor_id?nome(x.colportor_id):x.responsavel\vert{}\vert{}''}</td><td>${x.observacao||''}</td></tr>`).join('')}</table></div>
  <p class="mu">Erros se corrigem com um lançamento de Ajuste, mantendo o histórico completo.</p>`},
 rel(d=hoje()){return `<h2>Relatórios</h2><div class="c"><label>Data</label><input type="date" id="rd" value="${d}" onchange="draw('rel',this.value)"></div>
  <button onclick="$('#rt').value=rel($('#rd').value)">Gerar relatório</button><div style="height:10px"></div>
@@ -176,8 +167,8 @@ function hs(){const a=$('#h1').value,b=$('#h2').value,id=$('#h3').value,r=R(a,b,
  const rk=D.c.map(c=>({n:c.nome,v:S(r.filter(x=>x.colportor_id==c.id),'semeados')})).filter(x=>x.v>0).sort((x,y)=>y.v-x.v),mx=rk[0]?rk[0].v:1;
  const dias={};r.forEach(x=>dias[x.data]=(dias[x.data]||0)+x.semeados);const dk=Object.keys(dias).sort(),dm=Math.max(1,...Object.values(dias));
  $('#hr').innerHTML=`<div class="g">${card('Semeados',S(r,'semeados'))}${card('Distribuídos',S(r,'recebidos'))}${card('Devolvidos',S(r,'devolvidos'))}${card('Contatos',S(r,'contatos'))}${card('Indicações',S(r,'indicacoes'))}${card('Média semeados/colportor',n?(S(r,'semeados')/n).toFixed(1):0)}${card('Estoque atual',est(()=>1))}</div>
- <div class="c"><b>Semeados por dia</b>${dk.map(k=>`<div class="r" style="align-items:center"><small style="flex:0 0 70px">${br(k).slice(0,5)}</small><div class="bar" style="flex:none;width:${dias[k]/dm*100}%;min-width:4px"></div><small>${dias[k]}</small></div>`).join('')||'<p class="mu">Sem dados no período.</p>'}</div>
- <div class="c"><b>Ranking</b>${rk.map((x,i)=>`<div style="margin:8px 0">${i+1}. ${x.n} — ${x.v}<div class="bar" style="width:${x.v/mx*100}%"></div></div>`).join('')||'<p class="mu">Sem dados.</p>'}</div>`}
+ <div class="c"><b>Semeados por dia</b>${dk.map(k=>`<div class="r" style="align-items:center"><small style="flex:0 0 70px">${br(k).slice(0,5)}</small><div class="bar" style="flex:none;width:${dias[k]/dm*100}\%;min-width:4px"></div><small>${dias[k]}</small></div>`).join('')||'<p class="mu">Sem dados no período.</p>'}</div>
+ <div class="c"><b>Ranking</b>${rk.map((x,i)=>`<div style="margin:8px 0">${i+1}. ${x.n} —${x.v}<div class="bar" style="width:${x.v/mx*100}%"></div></div>`).join('')||'<p class="mu">Sem dados.</p>'}</div>`}
 function pr(t){const h=hoje();$('#h1').value=t=='d'?h:t=='s'?seg(h):h.slice(0,8)+'01';$('#h2').value=h;hs()}
 V.cfg=()=>`<h2>Configurações</h2><div class="c"><label>Nome da cooperativa</label><input id="cn2" value="${D.cf.cooperativa}"><label>Estoque mínimo (alerta)</label><input id="cm" type="number" value="${D.cf.estoque_minimo}"><div style="height:10px"></div><button onclick="svCfg()">Salvar</button></div>
 <div class="c"><b>Minha conta</b><p class="mu">${ME.email}${ME.admin?' · administrador':''}</p><button class="s" onclick="sb.auth.signOut().then(()=>location.reload())">Sair</button><div style="height:8px"></div><button class="s" onclick="lk()">Copiar link para configurar outro aparelho</button></div>
@@ -189,7 +180,7 @@ async function fechar(){const it=[...document.querySelectorAll('tr[data-id]')].m
  const{error}=await sb.rpc('fechar_dia',{p_data:d,p_itens:it,p_reabrir:ex});if(error)return alert(error.message);await sb.from('rascunhos').delete().eq('data',d);await load();location.hash='rel';draw('rel',d)}
 const addC=()=>$('#cn').value.trim()&&go(sb.from('colportores').insert({nome:$('#cn').value.trim()}));
 const tgl=(id,v)=>go(sb.from('colportores').update({ativo:v}).eq('id',id));
-const addM=()=>{const t=$('#mt').value,q=+$('#mq').value;if(!q||(t!='ajuste'&&q<0))return alert('Informe a quantidade.');go(sb.from('movimentacoes').insert({data:$('#md').value,tipo:t,quantidade:q,colportor_id:$('#mc').value||null,responsavel:$('#mr').value||ME.email,observacao:$('#mo').value}))};
+const addM=()=>{const t=$('#mt').value,q=+$('#mq').value;if(!q||(t!='ajuste'&&q<0))return alert('Informe a quantidade.');go(sb.from('movimentacoes').insert({data:$('#md').value,tipo:t,quantidade:q,colportor_id:$('#mc').value||null,responsavel:$('#mr').value\vert{}\vert{}ME.email,observacao:$('#mo').value}))};
 const svCfg=()=>go(sb.from('configuracoes').update({cooperativa:$('#cn2').value,estoque_minimo:+$('#cm').value}).eq('id',1));
 const cp=()=>{$('#rt').select();navigator.clipboard.writeText($('#rt').value).then(()=>alert('Copiado!'))};
 function draw(p,arg){p=p||location.hash.slice(1)||'dash';if(!V[p])p='dash';$('#nav').innerHTML=slug.map((s,i)=>`<a href="#${s}" class="${s==p?'on':''}">${pages[i]}</a>`).join('');
@@ -208,7 +199,7 @@ function rows(){return [...document.querySelectorAll('tr[data-id]')].map(tr=>{co
 function rasc(){clearTimeout(rt);const s=$('#sv');if(s)s.textContent='Salvando rascunho…';rt=setTimeout(async()=>{const d=$('#fd')&&$('#fd').value;if(!d)return;
  const{error}=await sb.from('rascunhos').upsert({data:d,itens:rows(),atualizado_por:ME.email,atualizado_em:new Date().toISOString()});
  if($('#sv'))$('#sv').textContent=error?'Erro ao salvar rascunho':'Rascunho salvo ✓'},600)}
-async function lr(d){const{data}=await sb.from('rascunhos').select('*').eq('data',d).maybeSingle();if(!data||!$('#fd')||$('#fd').value!=d)return;
+async function lr(d){const{data}=await sb.from('rascunhos').select('*').eq('data',d).maybeSingle();if(!data||!$('#fd')\vert{}\vert{}$('#fd').value!=d)return;
  data.itens.forEach(o=>{const tr=document.querySelector(`tr[data-id="${o.colportor_id}"]`);if(tr)tr.querySelectorAll('input').forEach(i=>i.value=o[i.dataset.k]||0)});tot();$('#sv').textContent='Rascunho recuperado ✓'}
 function authUI(m='in'){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>${m=='in'?'Entrar':'Criar conta'}</h2><div class="c"><div class="r"><button class="${m=='in'?'':'s'}" onclick="authUI('in')">Entrar</button><button class="${m=='up'?'':'s'}" onclick="authUI('up')">Criar conta</button></div>
  <input id="le" type="email" placeholder="E-mail" autocomplete="email"><div style="height:8px"></div><input id="lp" type="password" placeholder="Senha (mínimo 6 caracteres)" autocomplete="${m=='in'?'current-password':'new-password'}"><div style="height:10px"></div>
