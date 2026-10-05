@@ -24,8 +24,6 @@ textarea{min-height:300px;font-family:monospace}
 <header><b id="ttl">Cooperativa</b><nav id="nav"></nav></header>
 <main id="app"></main>
 <script type="text/plain" id="sqltxt">
--- COOPERATIVA DE LIVROS — rode TUDO de uma vez no SQL Editor do Supabase (botão Run)
-
 create table colportores(id uuid primary key default gen_random_uuid(), nome text not null, ativo boolean not null default true, criado_em timestamptz default now());
 create table fechamentos(id uuid primary key default gen_random_uuid(), data date unique not null, status text not null default 'fechado', fechado_por text, fechado_em timestamptz default now());
 create table movimentacoes(
@@ -44,17 +42,13 @@ create table resultados_diarios(
   indicacoes int not null default 0 check (indicacoes>=0), unique(fechamento_id, colportor_id));
 create table configuracoes(id int primary key default 1 check (id=1), cooperativa text default 'Cooperativa de Londrina', estoque_minimo int default 20);
 insert into configuracoes default values on conflict (id) do nothing;
--- rascunho do Fechamento do Dia: salvo automaticamente enquanto você digita
 create table rascunhos(data date primary key, itens jsonb not null, atualizado_por text, atualizado_em timestamptz default now());
-
--- Usuários: o PRIMEIRO cadastro vira administrador; os demais ficam aguardando aprovação
 create table perfis(id uuid primary key references auth.users on delete cascade, email text, admin boolean not null default false, aprovado boolean not null default false, criado_em timestamptz default now());
 create function public.novo_usuario() returns trigger language plpgsql security definer set search_path=public as $$ declare primeiro boolean; begin select count(*)=0 into primeiro from perfis;   insert into perfis(id,email,admin,aprovado) values (new.id,new.email,primeiro,primeiro); return new; end $$;
 create trigger ao_criar_usuario after insert on auth.users for each row execute function public.novo_usuario();
 create function public.aprovado() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from perfis where id=auth.uid() and aprovado)$$;
 create function public.eh_admin() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from perfis where id=auth.uid() and aprovado and admin)$$;
 
--- Estoque - única fonte da verdade
 drop view if exists estoque_atual;
 create view estoque_atual with (security_invoker=true) as
 select coalesce(sum(
@@ -66,10 +60,8 @@ select coalesce(sum(
 ), 0) as estoque
 from movimentacoes;
 
--- Fechar Dia: tudo ou nada (transação única)
-create or replace function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$ declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int; begin   if exists(select 1 from fechamentos where data=p_data) then     if not p_reabrir then raise exception 'Este dia já está fechado. Reabra para corrigir.'; end if;     delete from fechamentos where data=p_data;   end if;   insert into fechamentos(data,fechado_por) values (p_data, auth.jwt()->>'email') returning id into fid;   for it in select * from jsonb_array_elements(p_itens) loop     rec:=coalesce((it->>'recebidos')::int,0); sem:=coalesce((it->>'semeados')::int,0); dev:=coalesce((it->>'devolvidos')::int,0);     select coalesce(sum(case tipo when 'entrega' then quantidade else -quantidade end),0) into posse       from movimentacoes where colportor_id=(it->>'colportor_id')::uuid and data<p_data and tipo in ('entrega','devolucao','perda');     posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id       where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);     if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha (\%).',posse+rec; end if;     insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)       values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));     if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;   end loop;   select estoque into est from estoque_atual;   if est<0 then raise exception 'Estoque insuficiente: faltam \% kits.',-est; end if; end $$;
+create or replace function fechar_dia(p_data date, p_itens jsonb, p_reabrir boolean default false) returns void language plpgsql as $$ declare it jsonb; fid uuid; posse int; rec int; sem int; dev int; est int; begin   if exists(select 1 from fechamentos where data=p_data) then     if not p_reabrir then raise exception 'Este dia ja esta fechado. Reabra para corrigir.'; end if;     delete from fechamentos where data=p_data;   end if;   insert into fechamentos(data,fechado_por) values (p_data, auth.jwt()->>'email') returning id into fid;   for it in select * from jsonb_array_elements(p_itens) loop     rec:=coalesce((it->>'recebidos')::int,0); sem:=coalesce((it->>'semeados')::int,0); dev:=coalesce((it->>'devolvidos')::int,0);     select coalesce(sum(case tipo when 'entrega' then quantidade else -quantidade end),0) into posse       from movimentacoes where colportor_id=(it->>'colportor_id')::uuid and data<p_data and tipo in ('entrega','devolucao','perda');     posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id       where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);     if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha.'; end if;     insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)       values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));     if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;     if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;   end loop;   select estoque into est from estoque_atual;   if est<0 then raise exception 'Estoque insuficiente.'; end if; end $$;
 
--- Segurança: só usuários logados E aprovados enxergam ou alteram os dados
 do $$ declare t text; begin   foreach t in array array['colportores','fechamentos','movimentacoes','resultados_diarios','configuracoes','rascunhos'] loop     execute format('alter table \%I enable row level security',t);     execute format('drop policy if exists acesso on \%I',t);     execute format('create policy acesso on \%I for all to authenticated using (public.aprovado()) with check (public.aprovado())',t);   end loop; end $$;
 alter table perfis enable row level security;
 drop policy if exists ver_perfil on perfis;
@@ -86,7 +78,8 @@ const SB_KEY=(localStorage.getItem('sbk')||CFG0.key).trim();
 const OK=SB_URL.startsWith('https://'), $=s=>document.querySelector(s);
 const sb=supabase.createClient(OK?SB_URL:'https://x.supabase.co',OK?SB_KEY:'x');
 const hoje=()=>new Date().toLocaleDateString('sv',{timeZone:'America/Sao_Paulo'});
-const br=d=>d.split('-').reverse().join('/'), S=(a,k)=>a.reduce((s,x)=>s+(+x[k]||0),0);
+const br=d=>d?d.split('-').reverse().join('/'):'';
+const S=(a,k)=>a.reduce((s,x)=>s+(+x[k]||0),0);
 const add=(d,n)=>{const t=new Date(d+'T12:00:00');t.setDate(t.getDate()+n);return t.toISOString().slice(0,10)};
 const seg=d=>{const t=new Date(d+'T12:00:00');return add(d,-((t.getDay()+6)%7))};
 let D={};
@@ -103,8 +96,7 @@ async function load0(){
 async function lp(){const{data}=await sb.from('perfis').select('*').order('criado_em');D.p=data||[]}
 async function load(){await load0();await lp()}
 
-// Cálculo do Estoque da Cooperativa com verificações seguras
-const est = f => D.m.filter(f).reduce((s, x) => {
+const est = f => (D.m||[]).filter(f).reduce((s, x) => {
   const qtd = Number(x.quantidade) || 0;
   if (x.tipo === 'ajuste') return s + qtd;
   if (['estoque_inicial', 'entrada', 'devolucao'].includes(x.tipo)) return s + qtd;
@@ -114,23 +106,21 @@ const est = f => D.m.filter(f).reduce((s, x) => {
 
 const nome = id => (D.c.find(x => x.id == id) || {}).nome || '—';
 
-// Posse com colportor
 const posse = (id, antes = '9999-12-31') => {
-  const movs = D.m.filter(x => x.colportor_id == id && x.data < antes);
+  const movs = (D.m||[]).filter(x => x.colportor_id == id && x.data < antes);
   const recebidos = S(movs.filter(x => x.tipo === 'entrega'), 'quantidade');
   const devolvidos = S(movs.filter(x => x.tipo === 'devolucao' || x.tipo === 'perda'), 'quantidade');
-  const semeados = S(D.r.filter(x => x.colportor_id == id && x.data < antes), 'semeados');
+  const semeados = S((D.r||[]).filter(x => x.colportor_id == id && x.data < antes), 'semeados');
   return (recebidos - devolvidos) - semeados;
 };
 
-const R=(a,b,id)=>D.r.filter(x=>x.data>=a&&x.data<=b&&(!id||x.colportor_id==id));
+const R=(a,b,id)=>(D.r||[]).filter(x=>x.data>=a&&x.data<=b&&(!id||x.colportor_id==id));
 const card=(l,v,w)=>`<div class="c k ${w?'warn':''}"><small>${l}</small><b>${v}</b></div>`;
 const pages=['Dashboard','Fechamento do Dia','Colportores','Estoque','Movimentações','Relatórios','Histórico','Configurações'];
 const slug=['dash','fechar','colp','estoque','mov','rel','hist','cfg'];
-function msg(t,e){alert(t)}
 
 function rel(d){
- const rs=R(d,d), ms=D.m.filter(x=>x.data==d);
+ const rs=R(d,d), ms=(D.m||[]).filter(x=>x.data==d);
  const ini=est(x=>x.data<d);
  const en=S(ms.filter(x=>['entrada','estoque_inicial'].includes(x.tipo)),'quantidade');
  const sa=S(ms.filter(x=>x.tipo=='entrega'||x.tipo=='saida'),'quantidade');
@@ -139,7 +129,7 @@ function rel(d){
  const aj=at-(ini+en-sa+dv);
  const at_=rs.filter(x=>(+x.recebidos||0)+(+x.semeados||0)+(+x.devolvidos||0)+(+x.contatos||0)>0);
 
- return `RELATÓRIO — ${D.cf.cooperativa.toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} —${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`;
+ return `RELATÓRIO — ${(D.cf.cooperativa||'').toUpperCase()}\n${br(d)}\n\nKits semeados: ${S(rs,'semeados')}\nKits distribuídos: ${S(rs,'recebidos')}\nKits devolvidos: ${S(rs,'devolvidos')}\nContatos realizados: ${S(rs,'contatos')}\nIndicações: ${S(rs,'indicacoes')}\n\nColportores em atuação:\n${at_.map(x=>`${nome(x.colportor_id)} —${x.semeados} kits semeados`).join('\n')||'Nenhum'}\n\nEstoque:\nEstoque inicial: ${ini}\nEntradas: ${en}\nSaídas: ${sa}\nDevoluções: ${dv}${aj?`\nAjustes/perdas: ${aj}`:''}\nEstoque atual: ${at}`;
 }
 
 const V={
@@ -198,11 +188,9 @@ function draw(p,arg){p=p||location.hash.slice(1)||'dash';if(!V[p])p='dash';$('#n
 addEventListener('hashchange',()=>draw());
 let ME={},rt;
 const lk=()=>navigator.clipboard.writeText(location.origin+location.pathname+'#cfg='+btoa(JSON.stringify({u:SB_URL,k:SB_KEY}))).then(()=>alert('Link copiado! Abra-o no outro aparelho para configurar sozinho.'));
-function setup(){$('#nav').innerHTML='';$('#ttl').textContent='Configuração inicial (só uma vez)';
- $('#app').innerHTML=`<div class="c"><b>Passo 1.</b> Crie uma conta grátis em <b>supabase.com</b> e um projeto novo (região South America). Abra <b>SQL Editor > New query</b>, cole o código abaixo e clique em <b>Run</b>.<div style="height:8px"></div><textarea id="sq" readonly style="min-height:140px"></textarea><div style="height:8px"></div><button class="s" onclick="$('#sq').select();navigator.clipboard.writeText($('#sq').value).then(()=>alert('Copiado!'))">Copiar SQL</button></div>
- <div class="c"><b>Passo 2.</b> Em <b>Authentication > Sign In / Providers > Email</b>, desligue <b>Confirm email</b> (assim o cadastro entra direto).</div>
- <div class="c"><b>Passo 3.</b> Em <b>Project Settings > API</b>, copie e cole aqui:<div style="height:8px"></div><input id="su" placeholder="Project URL (https://...supabase.co)"><div style="height:8px"></div><input id="sk" placeholder="Chave anon / publishable"><div style="height:10px"></div><button onclick="const u=$('#su').value.trim(),k=$('#sk').value.trim();if(!u.startsWith('https://')||k.length<20)return alert('Confira a URL e a chave.');localStorage.setItem('sbu',u);localStorage.setItem('sbk',k);location.reload()">Salvar e continuar</button></div>
- <p class="mu">Depois, crie sua conta na tela seguinte: o primeiro cadastro vira administrador. Em Configurações você copia um link que configura os outros aparelhos sozinho.</p>`;
+function setup(){$('#nav').innerHTML='';$('#ttl').textContent='Configuração inicial';
+ $('#app').innerHTML=`<div class="c"><b>Passo 1.</b> Crie uma conta no Supabase. Abra SQL Editor, cole o código abaixo e execute.<div style="height:8px"></div><textarea id="sq" readonly style="min-height:140px"></textarea><div style="height:8px"></div><button class="s" onclick="$('#sq').select();navigator.clipboard.writeText($('#sq').value).then(()=>alert('Copiado!'))">Copiar SQL</button></div>
+ <div class="c"><b>Passo 2.</b> Insira a URL e a chave anon do Supabase:<div style="height:8px"></div><input id="su" placeholder="Project URL"><div style="height:8px"></div><input id="sk" placeholder="Chave anon"><div style="height:10px"></div><button onclick="const u=$('#su').value.trim(),k=$('#sk').value.trim();if(!u.startsWith('https://')||k.length<20)return alert('Confira os dados.');localStorage.setItem('sbu',u);localStorage.setItem('sbk',k);location.reload()">Salvar</button></div>`;
  $('#sq').value=$('#sqltxt').textContent.trim()}
 const ap=(id,v)=>go(sb.from('perfis').update({aprovado:v}).eq('id',id));
 function rows(){return [...document.querySelectorAll('tr[data-id]')].map(tr=>{const o={colportor_id:tr.dataset.id};tr.querySelectorAll('input').forEach(i=>o[i.dataset.k]=+i.value||0);return o})}
@@ -212,19 +200,19 @@ function rasc(){clearTimeout(rt);const s=$('#sv');if(s)s.textContent='Salvando r
 async function lr(d){const{data}=await sb.from('rascunhos').select('*').eq('data',d).maybeSingle();if(!data||!$('#fd')\vert{}\vert{}$('#fd').value!=d)return;
  data.itens.forEach(o=>{const tr=document.querySelector(`tr[data-id="${o.colportor_id}"]`);if(tr)tr.querySelectorAll('input').forEach(i=>i.value=o[i.dataset.k]||0)});tot();$('#sv').textContent='Rascunho recuperado ✓'}
 function authUI(m='in'){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>${m=='in'?'Entrar':'Criar conta'}</h2><div class="c"><div class="r"><button class="${m=='in'?'':'s'}" onclick="authUI('in')">Entrar</button><button class="${m=='up'?'':'s'}" onclick="authUI('up')">Criar conta</button></div>
- <input id="le" type="email" placeholder="E-mail" autocomplete="email"><div style="height:8px"></div><input id="lp" type="password" placeholder="Senha (mínimo 6 caracteres)" autocomplete="${m=='in'?'current-password':'new-password'}"><div style="height:10px"></div>
- <button onclick="doAuth('${m}')">${m=='in'?'Entrar':'Criar conta'}</button>${m=='up'?'<p class="mu">O primeiro cadastro vira administrador. Os demais precisam ser aprovados por ele.</p>':''}</div>`}
+ <input id="le" type="email" placeholder="E-mail" autocomplete="email"><div style="height:8px"></div><input id="lp" type="password" placeholder="Senha" autocomplete="${m=='in'?'current-password':'new-password'}"><div style="height:10px"></div>
+ <button onclick="doAuth('${m}')">${m=='in'?'Entrar':'Criar conta'}</button></div>`}
 async function doAuth(m){const e=$('#le').value.trim(),p=$('#lp').value;
  const r=m=='in'?await sb.auth.signInWithPassword({email:e,password:p}):await sb.auth.signUp({email:e,password:p});
  if(r.error)return alert(r.error.message.includes('Invalid login')?'E-mail ou senha incorretos.':r.error.message);
- if(m=='up'&&!r.data.session)return alert('Conta criada! Confirme pelo link enviado ao seu e-mail e depois entre.');
+ if(m=='up'&&!r.data.session)return alert('Conta criada!');
  location.reload()}
 async function start(){
  if(!OK){setup();return}
  const{data}=await sb.auth.getSession();if(!data.session)return authUI();
  const u=data.session.user,{data:p}=await sb.from('perfis').select('*').eq('id',u.id).maybeSingle();
  ME={id:u.id,email:u.email,admin:!!(p&&p.admin)};
- if(!p||!p.aprovado){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>Aguardando aprovação</h2><div class="c"><p>Sua conta (${u.email}) foi criada, mas o administrador ainda precisa aprová-la.</p><button onclick="location.reload()">Verificar de novo</button><div style="height:8px"></div><button class="s" onclick="sb.auth.signOut().then(()=>location.reload())">Sair</button></div>`;return}
+ if(!p||!p.aprovado){$('#nav').innerHTML='';$('#app').innerHTML=`<h2>Aguardando aprovação</h2><div class="c"><p>Sua conta (${u.email}) precisa de aprovação do administrador.</p><button onclick="location.reload()">Verificar de novo</button><div style="height:8px"></div><button class="s" onclick="sb.auth.signOut().then(()=>location.reload())">Sair</button></div>`;return}
  await load();draw()}
 start();
 </script></body></html>
