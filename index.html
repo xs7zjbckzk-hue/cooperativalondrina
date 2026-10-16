@@ -17,6 +17,7 @@ main{padding:14px;max-width:900px;margin:auto}h2{margin:4px 0 12px;font-size:20p
 .k small{color:var(--mu);display:block}.k b{font-size:26px}.k.warn{border-color:var(--rd);background:#fdecea}
 input,select,textarea,button{font:inherit;padding:9px;border:1px solid var(--bd);border-radius:8px;background:#fff;width:100%}
 button{background:var(--ac);color:#fff;border:0;font-weight:600;cursor:pointer}button.s{background:var(--ac2);color:var(--ac)}
+button.d{background:#fdecea;color:var(--rd)}
 .r{display:flex;gap:8px;margin-bottom:8px}.r>*{flex:1}label{font-size:12px;color:var(--mu)}
 table{width:100%;border-collapse:collapse}td,th{padding:6px 4px;text-align:left;border-bottom:1px solid var(--bd)}th{font-size:12px;color:var(--mu)}
 .sc{overflow-x:auto}td input{width:64px;padding:7px 4px;text-align:center}
@@ -144,17 +145,19 @@ const seg = d => {
 let D = {};
 
 async function load0(){
-  const [c, m, r, cf] = await Promise.all([
+  const [c, m, r, cf, fz] = await Promise.all([
     sb.from('colportores').select('*').order('nome'),
     sb.from('movimentacoes').select('*').order('data', {ascending:false}).order('criado_em', {ascending:false}),
-    sb.from('resultados_diarios').select('*,fechamentos(data)'),
-    sb.from('configuracoes').select('*').eq('id', 1).maybeSingle()
+    sb.from('resultados_diarios').select('*,fechamentos(data,id)'),
+    sb.from('configuracoes').select('*').eq('id', 1).maybeSingle(),
+    sb.from('fechamentos').select('*').order('data', {ascending:false})
   ]);
   D = {
     c: c.data || [],
     m: m.data || [],
     r: (r.data || []).map(x => ({...x, data: x.fechamentos ? x.fechamentos.data : ''})),
-    cf: cf.data || {cooperativa: 'Cooperativa de Londrina', estoque_minimo: 20}
+    cf: cf.data || {cooperativa: 'Cooperativa de Londrina', estoque_minimo: 20},
+    fz: fz.data || []
   };
   $('#ttl').textContent = D.cf.cooperativa;
 }
@@ -236,7 +239,7 @@ const V = {
   },
   colp(){
     return '<h2>Colportores</h2><div class="c"><div class="r"><input id="cn" placeholder="Nome do colportor"><button style="max-width:110px" onclick="addC()">Cadastrar</button></div></div>' +
-    D.c.map(c => { const r = R('0', '9999-12-31', c.id); return '<div class="c"><b>' + c.nome + '</b> <span class="mu">' + (c.ativo ? 'ativo' : 'inativo') + '</span><p class="mu" style="margin:4px 0">Recebeu ' + S(r, 'recebidos') + ' | Devolveu ' + S(r, 'devolvidos') + ' | Semeou ' + S(r, 'semeados') + ' | Com ele: ' + posse(c.id) + '</p><button class="s" onclick="tgl(\'' + c.id + '\',' + !c.ativo + ')">' + (c.ativo ? 'Inativar' : 'Reativar') + '</button></div>'; }).join('');
+    D.c.map(c => { const r = R('0', '9999-12-31', c.id); return '<div class="c"><div class="r"><input id="edit_c_' + c.id + '" value="' + c.nome + '"><button style="max-width:90px" onclick="editC(\'' + c.id + '\')">Salvar</button></div> <span class="mu">' + (c.ativo ? 'ativo' : 'inativo') + '</span><p class="mu" style="margin:4px 0">Recebeu ' + S(r, 'recebidos') + ' | Devolveu ' + S(r, 'devolvidos') + ' | Semeou ' + S(r, 'semeados') + ' | Com ele: ' + posse(c.id) + '</p><div style="display:flex;gap:8px"><button class="s" onclick="tgl(\'' + c.id + '\',' + !c.ativo + ')">' + (c.ativo ? 'Inativar' : 'Reativar') + '</button><button class="d" onclick="delC(\'' + c.id + '\')">Apagar</button></div></div>'; }).join('');
   },
   estoque(){
     const f = t => est(x => x.tipo == t);
@@ -249,7 +252,7 @@ const V = {
     '<div><label>Tipo</label><select id="mt"><option value="estoque_inicial">Estoque inicial</option><option value="entrada">Entrada</option><option value="entrega">Saida (entrega)</option><option value="devolucao">Devolucao</option><option value="perda">Perda/dano</option><option value="ajuste">Ajuste (+/-)</option></select></div></div>' +
     '<div class="r"><div><label>Quantidade</label><input type="number" id="mq" inputmode="numeric"></div><div><label>Colportor (opcional)</label><select id="mc"><option value="">-</option>' + D.c.map(c => '<option value="' + c.id + '">' + c.nome + '</option>').join('') + '</select></div></div>' +
     '<div class="r"><input id="mr" placeholder="Responsavel"><input id="mo" placeholder="Observacao"></div><button onclick="addM()">Registrar</button></div>' +
-    '<div class="c sc"><table><tr><th>Data</th><th>Tipo</th><th>Qtd</th><th>Quem</th><th>Obs</th></tr>' + D.m.slice(0, 100).map(x => '<tr><td>' + br(x.data) + '</td><td>' + x.tipo + '</td><td>' + x.quantidade + '</td><td>' + (x.colportor_id ? nome(x.colportor_id) : (x.responsavel || '')) + '</td><td>' + (x.observacao || '') + '</td></tr>').join('') + '</table></div>';
+    '<div class="c sc"><table><tr><th>Data</th><th>Tipo</th><th>Qtd</th><th>Quem</th><th>Obs</th><th>Ações</th></tr>' + D.m.slice(0, 100).map(x => '<tr><td>' + br(x.data) + '</td><td>' + x.tipo + '</td><td>' + x.quantidade + '</td><td>' + (x.colportor_id ? nome(x.colportor_id) : (x.responsavel || '')) + '</td><td>' + (x.observacao || '') + '</td><td><button class="d" style="padding:4px 8px;font-size:12px" onclick="delM(\'' + x.id + '\')">Excluir</button></td></tr>').join('') + '</table></div>';
   },
   rel(d = hoje()){
     return '<h2>Relatorios</h2><div class="c"><label>Data</label><input type="date" id="rd" value="' + d + '" onchange="draw(\'rel\',this.value)"></div>' +
@@ -258,7 +261,9 @@ const V = {
   },
   hist(){
     const h = hoje();
-    return '<h2>Historico</h2><div class="c"><div class="r"><div><label>De</label><input type="date" id="h1" value="' + add(h, -6) + '" onchange="hs()"></div><div><label>Ate</label><input type="date" id="h2" value="' + h + '" onchange="hs()"></div></div>' +
+    return '<h2>Historico / Fechamentos</h2><div class="c"><b>Dias Fechados</b>' + 
+      (D.fz.length ? D.fz.map(f => '<div class="r" style="align-items:center;margin-top:8px"><span><b>' + br(f.data) + '</b> <small class="mu">(' + f.status + ')</small></span><button class="d" style="max-width:110px" onclick="delFz(\'' + f.id + '\')">Desfazer Dia</button></div>').join('') : '<p class="mu">Nenhum fechamento registrado.</p>') + 
+      '</div><div class="c"><div class="r"><div><label>De</label><input type="date" id="h1" value="' + add(h, -6) + '" onchange="hs()"></div><div><label>Ate</label><input type="date" id="h2" value="' + h + '" onchange="hs()"></div></div>' +
     '<div class="r"><button class="s" onclick="pr(\'d\')">Hoje</button><button class="s" onclick="pr(\'s\')">Semana</button><button class="s" onclick="pr(\'m\')">Mes</button></div>' +
     '<label>Colportor</label><select id="h3" onchange="hs()"><option value="">Todos</option>' + D.c.map(c => '<option value="' + c.id + '">' + c.nome + '</option>').join('') + '</select></div><div id="hr"></div>';
   }
@@ -313,7 +318,12 @@ async function fechar(){
 }
 
 const addC = () => $('#cn').value.trim() && go(sb.from('colportores').insert({nome: $('#cn').value.trim()}));
+const editC = (id) => { const nome = $('#edit_c_' + id).value.trim(); if(nome) go(sb.from('colportores').update({nome}).eq('id', id)); };
 const tgl = (id, v) => go(sb.from('colportores').update({ativo: v}).eq('id', id));
+const delC = (id) => confirm('Tem certeza que deseja apagar este colportor?') && go(sb.from('colportores').delete().eq('id', id));
+const delM = (id) => confirm('Tem certeza que deseja excluir esta movimentacao?') && go(sb.from('movimentacoes').delete().eq('id', id));
+const delFz = (id) => confirm('Tem certeza que deseja desfazer/apagar este dia fechado?') && go(sb.from('fechamentos').delete().eq('id', id));
+
 const addM = () => {
   const t = $('#mt').value, q = +$('#mq').value;
   if(!q || (t != 'ajuste' && q < 0)) return alert('Informe a quantidade.');
