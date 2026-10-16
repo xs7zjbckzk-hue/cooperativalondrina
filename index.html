@@ -43,8 +43,7 @@ create table resultados_diarios(
   fechamento_id uuid not null references fechamentos on delete cascade,
   colportor_id uuid not null references colportores,
   recebidos int not null default 0 check (recebidos>=0), semeados int not null default 0 check (semeados>=0),
-  devolvidos int not null default 0 check (devolvidos>=0), contatos int not null default 0 check (contatos>=0),
-  indicacoes int not null default 0 check (indicacoes>=0), unique(fechamento_id, colportor_id));
+  devolvidos int not null default 0 check (devolvidos>=0), unique(fechamento_id, colportor_id));
 create table configuracoes(id int primary key default 1 check (id=1), cooperativa text default 'Cooperativa de Londrina', estoque_minimo int default 20);
 insert into configuracoes default values on conflict (id) do nothing;
 create table rascunhos(data date primary key, itens jsonb not null, atualizado_por text, atualizado_em timestamptz default now());
@@ -85,8 +84,8 @@ begin
     posse:=posse-coalesce((select sum(r.semeados) from resultados_diarios r join fechamentos f on f.id=r.fechamento_id
       where r.colportor_id=(it->>'colportor_id')::uuid and f.data<p_data),0);
     if sem+dev>posse+rec then raise exception 'Semeados + devolvidos maior que os kits que o colportor tinha.'; end if;
-    insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos,contatos,indicacoes)
-      values (fid,(it->>'colportor_id')::uuid,rec,sem,dev,coalesce((it->>'contatos')::int,0),coalesce((it->>'indicacoes')::int,0));
+    insert into resultados_diarios(fechamento_id,colportor_id,recebidos,semeados,devolvidos)
+      values (fid,(it->>'colportor_id')::uuid,rec,sem,dev);
     if rec>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'entrega',rec,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
     if sem>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'saida',sem,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
     if dev>0 then insert into movimentacoes(data,tipo,quantidade,colportor_id,responsavel,fechamento_id) values (p_data,'devolucao',dev,(it->>'colportor_id')::uuid,'Fechamento',fid); end if;
@@ -201,14 +200,12 @@ function rel(d){
   const dv = S(ms.filter(x => x.tipo == 'devolucao'), 'quantidade');
   const at = est(x => x.data <= d);
   const aj = at - (ini + en - sa + dv);
-  const at_ = rs.filter(x => (+x.recebidos||0) + (+x.semeados||0) + (+x.devolvidos||0) + (+x.contatos||0) > 0);
+  const at_ = rs.filter(x => (+x.recebidos||0) + (+x.semeados||0) + (+x.devolvidos||0) > 0);
 
   let text = 'RELATORIO - ' + (D.cf.cooperativa || '').toUpperCase() + '\n' + br(d) + '\n\n';
   text += 'Kits semeados: ' + S(rs, 'semeados') + '\n';
   text += 'Kits distribuidos: ' + S(rs, 'recebidos') + '\n';
-  text += 'Kits devolvidos: ' + S(rs, 'devolvidos') + '\n';
-  text += 'Contatos realizados: ' + S(rs, 'contatos') + '\n';
-  text += 'Indicacoes: ' + S(rs, 'indicacoes') + '\n\n';
+  text += 'Kits devolvidos: ' + S(rs, 'devolvidos') + '\n\n';
   text += 'Colportores em atuacao:\n';
   text += (at_.map(x => nome(x.colportor_id) + ' - ' + x.semeados + ' kits semeados').join('\n') || 'Nenhum') + '\n\n';
   text += 'Estoque:\n';
@@ -232,9 +229,9 @@ const V = {
     const ex = D.r.some(x => x.data == d), at = D.c.filter(x => x.ativo);
     return '<h2>Fechamento do Dia</h2><div class="c"><label>Data</label><input type="date" id="fd" value="' + d + '" onchange="draw(\'fechar\',this.value)">' +
     (ex ? '<p class="mu">Dia ja fechado. Ao salvar, ele sera reaberto e recalculado.</p>' : '') + '</div>' +
-    '<div class="c sc"><table><tr><th>Colportor</th><th>Receb.</th><th>Semeou</th><th>Devolv.</th><th>Contatos</th><th>Indic.</th></tr>' +
-    (at.map(c => '<tr data-id="' + c.id + '"><td>' + c.nome + '<br><small class="mu">com ele: ' + posse(c.id, d) + '</small></td>' + ['recebidos','semeados','devolvidos','contatos','indicacoes'].map(k => { const r = D.r.find(x => x.data == d && x.colportor_id == c.id) || {}; return '<td><input type="number" min="0" inputmode="numeric" data-k="' + k + '" value="' + (r[k] || 0) + '" oninput="tot();rasc()"></td>'; }).join('') + '</tr>').join('') || '<tr><td>Cadastre colportores primeiro.</td></tr>') +
-    '<tr><th>Total</th><th id="t0"></th><th id="t1"></th><th id="t2"></th><th id="t3"></th><th id="t4"></th></tr></table></div>' +
+    '<div class="c sc"><table><tr><th>Colportor</th><th>Receb.</th><th>Semeou</th><th>Devolv.</th></tr>' +
+    (at.map(c => '<tr data-id="' + c.id + '"><td>' + c.nome + '<br><small class="mu">com ele: ' + posse(c.id, d) + '</small></td>' + ['recebidos','semeados','devolvidos'].map(k => { const r = D.r.find(x => x.data == d && x.colportor_id == c.id) || {}; return '<td><input type="number" min="0" inputmode="numeric" data-k="' + k + '" value="' + (r[k] || 0) + '" oninput="tot();rasc()"></td>'; }).join('') + '</tr>').join('') || '<tr><td>Cadastre colportores primeiro.</td></tr>') +
+    '<tr><th>Total</th><th id="t0"></th><th id="t1"></th><th id="t2"></th></tr></table></div>' +
     '<small id="sv" class="mu"></small><div style="height:8px"></div><button onclick="fechar()">Fechar Dia</button>';
   },
   colp(){
@@ -275,7 +272,7 @@ function hs(){
   const dias = {}; r.forEach(x => dias[x.data] = (dias[x.data] || 0) + x.semeados);
   const dk = Object.keys(dias).sort(), dm = Math.max(1, ...Object.values(dias));
   
-  $('#hr').innerHTML = '<div class="g">' + card('Semeados', S(r, 'semeados')) + card('Distribuidos', S(r, 'recebidos')) + card('Devolvidos', S(r, 'devolvidos')) + card('Contatos', S(r, 'contatos')) + card('Indicacoes', S(r, 'indicacoes')) + card('Media semeados/colportor', n ? (S(r, 'semeados') / n).toFixed(1) : 0) + card('Estoque atual', est(() => 1)) + '</div>' +
+  $('#hr').innerHTML = '<div class="g">' + card('Semeados', S(r, 'semeados')) + card('Distribuidos', S(r, 'recebidos')) + card('Devolvidos', S(r, 'devolvidos')) + card('Media semeados/colportor', n ? (S(r, 'semeados') / n).toFixed(1) : 0) + card('Estoque atual', est(() => 1)) + '</div>' +
   '<div class="c"><b>Semeados por dia</b>' + (dk.map(k => '<div class="r" style="align-items:center"><small style="flex:0 0 70px">' + br(k).slice(0, 5) + '</small><div class="bar" style="flex:none;width:' + (dias[k] / dm * 100) + '%;min-width:4px"></div><small>' + dias[k] + '</small></div>').join('') || '<p class="mu">Sem dados no periodo.</p>') + '</div>' +
   '<div class="c"><b>Ranking</b>' + (rk.map((x, i) => '<div style="margin:8px 0">' + (i + 1) + '. ' + x.n + ' - ' + x.v + '<div class="bar" style="width:' + (x.v / mx * 100) + '%"></div></div>').join('') || '<p class="mu">Sem dados.</p>') + '</div>';
 }
@@ -292,7 +289,7 @@ V.cfg = () => '<h2>Configuracoes</h2><div class="c"><label>Nome da cooperativa</
 (ME.admin ? '<div class="c"><b>Usuarios</b>' + D.p.map(u => '<div class="r" style="align-items:center"><span>' + u.email + '<br><small class="mu">' + (u.admin ? 'administrador | ' : '') + (u.aprovado ? 'aprovado' : 'aguardando aprovação') + '</small></span>' + (u.id == ME.id ? '' : '<button class="s" onclick="ap(\'' + u.id + '\',' + !u.aprovado + ')">' + (u.aprovado ? 'Bloquear' : 'Aprovar') + '</button>') + '</div>').join('') + '</div>' : '');
 
 function tot(){
-  ['recebidos','semeados','devolvidos','contatos','indicacoes'].forEach((k, i) => {
+  ['recebidos','semeados','devolvidos'].forEach((k, i) => {
     $('#t' + i).textContent = [...document.querySelectorAll('[data-k=' + k + ']')].reduce((s, x) => s + (+x.value || 0), 0);
   });
 }
